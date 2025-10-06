@@ -21,3 +21,5 @@ ENV/
 
 # Output files
 *.csv
+
+credentials.json
