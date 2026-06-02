@@ -281,26 +281,33 @@ class BlackbaudSISExporter:
                             if self._should_skip_course(course_title):
                                 continue
 
+                            # Get department info first (needed for BlendEd check)
+                            departments = enrollment.get('departments', [])
+
+                            # Check for BlendEd courses FIRST (highest priority)
+                            blended_dept = self._check_blended_course(course_title, departments)
+                            if blended_dept:
+                                dept_name = blended_dept
                             # Check for special course prefixes that override department
-                            special_dept = self._check_special_course_prefix(course_title)
-                            if special_dept:
+                            elif self._check_special_course_prefix(course_title):
+                                special_dept = self._check_special_course_prefix(course_title)
                                 dept_name = special_dept
+                            elif (course_title == 'Social Psychology (H)'
+                                  or course_title == 'Politics of Elections (H)'):
+                                dept_name = 'History/Social Science'
+                            elif course_title == 'French V (H)':
+                                dept_name = 'Language'
                             # Check block_name - if it doesn't contain A-G, put in "Other"
                             elif not any(letter in enrollment.get('block_name', '') for letter in 'ABCDEFG'):
                                 dept_name = 'Other'
                             else:
-                                # Get department name
-                                departments = enrollment.get('departments', [])
-
+                                # Get department name from departments list
                                 if not departments:
                                     dept_name = 'Other'
                                 elif departments[0].get('name') == 'Humanities':
                                     # If primary department is Humanities, use second department
                                     if len(departments) > 1:
                                         dept_name = departments[1].get('name', 'Other')
-                                    elif (course_title == 'Social Psychology (H)'
-                                            or course_title == "Politics of Elections (H)'"):
-                                        dept_name = 'History/Social Science'
                                     else:
                                         print(f"ERROR: Course '{course_title}' has 'Humanities' as primary department but no second department")
                                         dept_name = 'Other'
@@ -317,6 +324,7 @@ class BlackbaudSISExporter:
                             # Log warning if course with (H) ends up in Other
                             if '(H)' in course_title and dept_name == 'Other':
                                 print(f"WARNING: Course '{course_title}' contains '(H)' but was categorized as 'Other'")
+                                print(enrollment)
 
                             # Add course to department
                             if dept_name not in courses_by_dept:
@@ -353,6 +361,46 @@ class BlackbaudSISExporter:
             return 'Literature'
 
         return None
+
+    def _check_blended_course(self, course_title, departments):
+        """Check if course is BlendEd and determine target department
+
+        BlendEd courses have higher priority than other department assignments.
+        - Science/Math/World Languages: keep in that department
+        - Literature: keep in Literature
+        - Humanities (not Literature): move to History/Social Science
+        """
+        if '(BlendEd)' not in course_title:
+            return None
+
+        if not departments:
+            return 'Other'
+
+        primary_dept = departments[0].get('name')
+
+        # Science, Math, or World Languages: keep in original department
+        if primary_dept in ['Science', 'Math', 'World Languages']:
+            return primary_dept
+
+        # Humanities courses: check secondary department
+        if primary_dept == 'Humanities':
+            if len(departments) > 1:
+                secondary_dept = departments[1].get('name')
+                if secondary_dept == 'Literature':
+                    return 'Literature'
+                else:
+                    # Humanities but not Literature → History/Social Science
+                    return 'History/Social Science'
+            else:
+                # Humanities with no secondary dept → History/Social Science
+                return 'History/Social Science'
+
+        # Direct Literature department (if not under Humanities)
+        if primary_dept == 'Literature':
+            return 'Literature'
+
+        # Default: keep in original department
+        return primary_dept
 
     def _apply_department_config(self, course_title, original_dept):
         """Apply department configuration overrides"""
@@ -558,6 +606,9 @@ class BlackbaudSISExporter:
 
             # Create summary sheet after all student sheets are populated
             self._create_summary_sheet(sheets_service, spreadsheet_id, students_data)
+
+            # Create course breakdown sheet
+            self._create_course_breakdown_sheet(sheets_service, spreadsheet_id, students_data)
 
             return created_spreadsheet
         except HttpError as err:
@@ -991,19 +1042,49 @@ class BlackbaudSISExporter:
             if course_name in excluded_courses:
                 return 0
 
-            # Count how many non-excluded courses come before this one
-            non_excluded_count = 0
-            for i in range(course_index + 1):
-                if all_courses[i] not in excluded_courses:
-                    non_excluded_count += 1
+            # Special case for Humanitas (H) - counts as 2 seminars
+            if course_name == 'Humanitas (H)':
+                # Count how many seminar slots are used before this course
+                slots_used = 0
+                for i in range(course_index):
+                    if all_courses[i] not in excluded_courses:
+                        if all_courses[i] == 'Humanitas (H)':
+                            slots_used += 2
+                        else:
+                            slots_used += 1
 
-            # First 2 non-excluded courses are worth 0, additional courses worth 0.5
-            if non_excluded_count <= 2:
+                # Humanitas occupies 2 slots
+                # Slots 1-2 are free, slots 3+ cost 0.5 each
+                score = 0
+                for slot_num in [slots_used + 1, slots_used + 2]:
+                    if slot_num > 2:
+                        score += 0.5
+
+                return score
+
+            # Regular seminar logic for other courses
+            # Count how many seminar slots are used before this course
+            slots_used = 0
+            for i in range(course_index):
+                if all_courses[i] not in excluded_courses:
+                    if all_courses[i] == 'Humanitas (H)':
+                        slots_used += 2
+                    else:
+                        slots_used += 1
+
+            # This course occupies 1 slot
+            slot_num = slots_used + 1
+
+            if slot_num <= 2:
                 return 0
             else:
                 return 0.5
 
         elif department == 'Math':
+            # BlendEd courses always worth 0.5
+            if '(BlendEd)' in course_name:
+                return 0.5
+
             # Specific courses worth 1.0
             high_value_courses = [
                 'Calculus I (H)',
@@ -1028,6 +1109,10 @@ class BlackbaudSISExporter:
                 return 0
 
         elif department == 'Science':
+            # BlendEd courses always worth 0.5
+            if '(BlendEd)' in course_name:
+                return 0.5
+
             # Courses with (H) are worth 1.0
             if '(H)' in course_name:
                 return 1.0
@@ -1041,7 +1126,8 @@ class BlackbaudSISExporter:
             # Specific courses worth 1.0
             high_value_courses = [
                 'Computer Science II (H)',
-                'Advanced Computer Science (H)'
+                'Advanced Computer Science (H)',
+                'Advanced Engineering (H)'
             ]
 
             # Specific courses worth 0.5
@@ -1059,6 +1145,10 @@ class BlackbaudSISExporter:
                 return 0
 
         elif department == 'World Languages':
+            # BlendEd courses always worth 0.5
+            if '(BlendEd)' in course_name:
+                return 0.5
+
             # Courses with IV (H) or V (H) are worth 1.0
             if 'IV (H)' in course_name or 'V (H)' in course_name:
                 return 1.0
@@ -1071,6 +1161,111 @@ class BlackbaudSISExporter:
                 return 0
 
         # Default: no score for other departments (yet)
+        return 0
+
+    def _get_course_base_value(self, department, course_name):
+        """Get the base point value for a course (when it does score points)
+        This is used for the Course Breakdown sheet.
+        """
+        if department == 'Literature':
+            # Excluded courses worth 0
+            excluded_courses = ['US Literature', 'World Literature']
+            if course_name in excluded_courses:
+                return 0
+            # Non-excluded seminars worth 0.5 (after first 4)
+            return 0.5
+
+        elif department == 'History/Social Science':
+            # Excluded courses worth 0
+            excluded_courses = ['US History', 'World History']
+            if course_name in excluded_courses:
+                return 0
+            # Humanitas is special - worth up to 1.0 (0.5 per slot beyond free slots)
+            if course_name == 'Humanitas (H)':
+                return 1.0
+            # Other seminars worth 0.5 (after first 2)
+            return 0.5
+
+        elif department == 'Math':
+            # BlendEd courses always worth 0.5
+            if '(BlendEd)' in course_name:
+                return 0.5
+
+            # Specific courses worth 1.0
+            high_value_courses = [
+                'Calculus I (H)',
+                'AP Calculus AB',
+                'Calculus II (H)',
+                'Statistics (H)',
+                'Multivariable Calculus (H)'
+            ]
+
+            # Specific courses worth 0.5
+            medium_value_courses = [
+                'Algebra II (H)',
+                'Pre-Calculus (H)',
+                'Calculus'
+            ]
+
+            if course_name in high_value_courses:
+                return 1.0
+            elif course_name in medium_value_courses:
+                return 0.5
+            else:
+                return 0
+
+        elif department == 'Science':
+            # BlendEd courses always worth 0.5
+            if '(BlendEd)' in course_name:
+                return 0.5
+
+            # Courses with (H) are worth 1.0
+            if '(H)' in course_name:
+                return 1.0
+            # Anatomy and Physiology (without H) is worth 0.5
+            elif course_name == 'Anatomy & Physiology':
+                return 0.5
+            else:
+                return 0
+
+        elif department == 'Computer Science and Engineering':
+            # Specific courses worth 1.0
+            high_value_courses = [
+                'Computer Science II (H)',
+                'Advanced Computer Science (H)',
+                'Advanced Engineering (H)'
+            ]
+
+            # Specific courses worth 0.5
+            medium_value_courses = [
+                'Advanced Topics in Computer Science (H)',
+                'Data Structures and Algorithms (H)',
+                'Software Engineering (H)'
+            ]
+
+            if course_name in high_value_courses:
+                return 1.0
+            elif course_name in medium_value_courses:
+                return 0.5
+            else:
+                return 0
+
+        elif department == 'World Languages':
+            # BlendEd courses always worth 0.5
+            if '(BlendEd)' in course_name:
+                return 0.5
+
+            # Courses with IV (H) or V (H) are worth 1.0
+            if 'IV (H)' in course_name or 'V (H)' in course_name:
+                return 1.0
+            # Courses with IV (no H) or III (H) are worth 0.5
+            elif ('III (H)' in course_name or
+                  (' IV' in course_name and 'IV (H)' not in course_name)):
+                return 0.5
+            else:
+                return 0
+
+        # Default: no score for other departments
         return 0
 
     def _get_sheet_id(self, sheets_service, spreadsheet_id, sheet_name):
@@ -1386,6 +1581,192 @@ class BlackbaudSISExporter:
 
         except HttpError as err:
             print(f"Error creating summary sheet: {err}")
+
+    def _create_course_breakdown_sheet(self, sheets_service, spreadsheet_id, students_data):
+        """Create a Course Breakdown sheet showing all courses with their departments, counts, and point values"""
+        print("Creating course breakdown sheet...")
+
+        # Aggregate course information
+        # course_info = {course_name: {'department': dept, 'count': count}}
+        course_info = {}
+
+        for student in students_data:
+            courses_by_dept = student['courses']
+            for dept, courses in courses_by_dept.items():
+                for course in courses:
+                    if course not in course_info:
+                        course_info[course] = {'department': dept, 'count': 0}
+                    course_info[course]['count'] += 1
+
+        # Sort courses by department (using primary department order), then by course name
+        dept_order = {dept: i for i, dept in enumerate(DEPARTMENT_CONFIG['primary_departments'])}
+
+        sorted_courses = sorted(
+            course_info.items(),
+            key=lambda x: (dept_order.get(x[1]['department'], 999), x[0])
+        )
+
+        # Prepare data for the sheet
+        # Header row
+        data = [['Course Name', 'Department', 'Student Count', 'Point Value']]
+
+        # Course rows
+        for course_name, info in sorted_courses:
+            dept = info['department']
+            count = info['count']
+            point_value = self._get_course_base_value(dept, course_name)
+
+            # Only show non-zero point values
+            point_display = point_value if point_value > 0 else ''
+
+            data.append([course_name, dept, count, point_display])
+
+        # Create the Course Breakdown sheet
+        try:
+            # Add the sheet
+            add_sheet_request = {
+                'addSheet': {
+                    'properties': {
+                        'title': 'Course Breakdown',
+                        'index': 1  # Place after Summary (which is at index 0)
+                    }
+                }
+            }
+
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={'requests': [add_sheet_request]}
+            ).execute()
+
+            print("Course Breakdown sheet created")
+
+            # Populate with data
+            sheets_service.spreadsheets().values().update(
+                spreadsheetId=spreadsheet_id,
+                range="Course Breakdown!A1",
+                valueInputOption='RAW',
+                body={'values': data}
+            ).execute()
+
+            # Format the sheet
+            sheet_id = self._get_sheet_id(sheets_service, spreadsheet_id, 'Course Breakdown')
+            requests = []
+
+            # Header row - bold and centered
+            requests.append({
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'startRowIndex': 0,
+                        'endRowIndex': 1
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'textFormat': {
+                                'bold': True
+                            },
+                            'horizontalAlignment': 'CENTER',
+                            'backgroundColor': {
+                                'red': 0.85,
+                                'green': 0.85,
+                                'blue': 0.85
+                            }
+                        }
+                    },
+                    'fields': 'userEnteredFormat(textFormat,horizontalAlignment,backgroundColor)'
+                }
+            })
+
+            # Set column widths
+            # Column A: Course Name - 350 pixels
+            requests.append({
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': 0,
+                        'endIndex': 1
+                    },
+                    'properties': {
+                        'pixelSize': 350
+                    },
+                    'fields': 'pixelSize'
+                }
+            })
+
+            # Column B: Department - 250 pixels
+            requests.append({
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': 1,
+                        'endIndex': 2
+                    },
+                    'properties': {
+                        'pixelSize': 250
+                    },
+                    'fields': 'pixelSize'
+                }
+            })
+
+            # Columns C-D: Student Count and Point Value - 120 pixels each
+            requests.append({
+                'updateDimensionProperties': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'dimension': 'COLUMNS',
+                        'startIndex': 2,
+                        'endIndex': 4
+                    },
+                    'properties': {
+                        'pixelSize': 120
+                    },
+                    'fields': 'pixelSize'
+                }
+            })
+
+            # Center align columns C and D (Student Count and Point Value)
+            requests.append({
+                'repeatCell': {
+                    'range': {
+                        'sheetId': sheet_id,
+                        'startRowIndex': 1,
+                        'startColumnIndex': 2,
+                        'endColumnIndex': 4
+                    },
+                    'cell': {
+                        'userEnteredFormat': {
+                            'horizontalAlignment': 'CENTER'
+                        }
+                    },
+                    'fields': 'userEnteredFormat.horizontalAlignment'
+                }
+            })
+
+            # Freeze header row
+            requests.append({
+                'updateSheetProperties': {
+                    'properties': {
+                        'sheetId': sheet_id,
+                        'gridProperties': {
+                            'frozenRowCount': 1
+                        }
+                    },
+                    'fields': 'gridProperties.frozenRowCount'
+                }
+            })
+
+            # Execute all formatting requests
+            sheets_service.spreadsheets().batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={'requests': requests}
+            ).execute()
+
+            print("Course Breakdown sheet populated and formatted")
+
+        except HttpError as err:
+            print(f"Error creating course breakdown sheet: {err}")
 
     def export_senior_courses_to_csv(self, filename="senior_courses.csv", role_id=None):
         """Main export function"""
